@@ -222,17 +222,18 @@ def generate_filter(args: argparse.Namespace):
 
     return cfg_filter
 
-
-def load_model_isolated_with_allocator_and_timer(
-    config: TorchBenchModelConfig, allocator: str, alloc_func: str, free_func: str, cache_info_func: str, timeout: float = WORKER_TIMEOUT
-) -> ModelTask:
-    """Load and return the model in a subprocess. Optionally, save its stdout and stderr to the specified directory."""
+def init_model_task(config: TorchBenchModelConfig, timeout: float = WORKER_TIMEOUT) -> ModelTask:
     task = ModelTask(
         config.name,
         timeout=timeout,
         extra_env=config.extra_env,
         save_output_dir=config.output_dir,
     )
+    return task
+
+def load_model_task_with_allocator_and_timer(
+    task: ModelTask, config: TorchBenchModelConfig, allocator: str, alloc_func: str, free_func: str, cache_info_func: str
+):
     task.worker.run("import time")
     task.worker.run("from torchbenchmark.util.extra_args import (TEST_STAGE)")
     task.worker.run("""class RunTimer:
@@ -304,7 +305,6 @@ def load_model_isolated_with_allocator_and_timer(
             f"User specify batch size {config.batch_size},"
             + f"but model {task.name} runs with batch size {task_batch_size}. Please report a bug."
         )
-    return task
 
 def run(args: List[str]):
     args = parse_args(args)
@@ -317,20 +317,32 @@ def run(args: List[str]):
     cfg_filter = generate_filter(args)
     # run a model cfg and get latencies
     full_results = []
+    outs_errs = []
     for _round in range(args.rounds):
         single_round_result = []
+        single_round_out_err = []
         for cfg in filter(cfg_filter, cfgs):
             print(f"[Round {_round}/{args.rounds}] Running {cfg}")
             try:
-                task = load_model_isolated_with_allocator_and_timer(cfg, args.allocator, args.alloc_func, args.free_func, args.cache_info_func)
+                task = init_model_task(cfg)
                 # get the model test metrics
-                metrics: TorchBenchModelMetrics = get_model_test_metrics(
-                    task, metrics=["latencies"], num_iter=args.iterations
-                )
-                run_times = task.worker.load("run_times")
-                forward_times = task.worker.load("forward_times")
-                backward_times = task.worker.load("backward_times")
-                optimizer_times = task.worker.load("optimizer_times")
+                with task.worker.watch_stdout_stderr() as get_output:
+                    load_model_task_with_allocator_and_timer(task, cfg, args.allocator, args.alloc_func, args.free_func, args.cache_info_func)
+                    metrics: TorchBenchModelMetrics = get_model_test_metrics(
+                        task, metrics=["latencies"], num_iter=args.iterations
+                    )
+                    run_times = task.worker.load("run_times")
+                    forward_times = task.worker.load("forward_times")
+                    backward_times = task.worker.load("backward_times")
+                    optimizer_times = task.worker.load("optimizer_times")
+                    stdout, stderr = get_output()
+                    single_round_out_err.append(
+                        {
+                            "cfg": {key: str(value) for key, value in cfg.__dict__.items()},
+                            "stdout": stdout,
+                            "stderr": stderr,
+                        }
+                    )
                 raw_metrics = {
                     "run_times": [x / NANOSECONDS_PER_MILLISECONDS for x in run_times],
                     "forward_times": [x / NANOSECONDS_PER_MILLISECONDS for x in forward_times],
@@ -370,11 +382,14 @@ def run(args: List[str]):
                 # Remove task reference to trigger deletion in gc
                 task = None
         full_results.append(single_round_result)
+        outs_errs.append(single_round_out_err)
     # reduce full results to metrics
     # log detailed results in the .userbenchmark/model-stableness/logs/ directory
     logs_fname = output_dir.joinpath(f"logs-{timestamp}.json")
-    print(full_results)
     with open(logs_fname, "w") as f:
+        json.dump(outs_errs, f, indent=4)
+    raw_metrics_fname = output_dir.joinpath(f"raw_metrics-{timestamp}.json")
+    with open(raw_metrics_fname, "w") as f:
         json.dump(full_results, f, indent=4)
     # output userbenchmark metrics in the .userbenchmark/model-stableness directory
     ub_metrics = reduce_results(full_results)
