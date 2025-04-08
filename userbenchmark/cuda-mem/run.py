@@ -33,9 +33,11 @@ BS_FIELD_NAME = "batch_size"
 BM_NAME = "cuda-mem"
 DEFAULT_ROUNDS = 3
 DEFAULT_BATCH_SIZE = 1
+DEFAULT_METRICS = ["latencies", "cpu_peak_mem", "gpu_peak_mem", "ttfb", "pt2_compilation_time", "pt2_graph_breaks"]
 DEFAULT_ALLOCATOR = ""
 DEFAULT_ALLOC_FUNC = "alloc"
 DEFAULT_FREE_FUNC = "free"
+DEFAULT_CACHE_INFO_FUNC = "cache_info"
 DEFAULT_ITERATIONS = 5
 
 WARMUP_ROUNDS = 0
@@ -48,7 +50,6 @@ def generate_model_config(model_name: str, args: argparse.Namespace, output_dir:
     devices = ["cpu", "cuda"]
     tests = ["train", "eval"]
     cfgs = itertools.product(*[devices, tests])
-    print(parse_env(args.envs) if args.envs != "" else None)
     result = [
         TorchBenchModelConfig(
             name=model_name,
@@ -96,7 +97,7 @@ def parse_args(args: List[str]):
     )
     parser.add_argument(
         "--metrics",
-        default=",".join(["latencies", "cpu_peak_mem", "gpu_peak_mem", "ttfb", "pt2_compilation_time", "pt2_graph_breaks"]),
+        default=",".join(DEFAULT_METRICS),
         help="Specify the metrics to run.",
     )
     parser.add_argument(
@@ -126,6 +127,11 @@ def parse_args(args: List[str]):
         "--free-func",
         default=DEFAULT_FREE_FUNC,
         help="Free function name of user defined allocator. Default is \"free\".",
+    )
+    parser.add_argument(
+        "--cache_info-func",
+        default=DEFAULT_CACHE_INFO_FUNC,
+        help="Cache info function name of user defined allocator. Default is \"cache_info\".",
     )
     # parser.add_argument("-d", "--device", default="cpu", help="Specify the device.")
     parser.add_argument("-t", "--test", default="eval", help="Specify the test.")
@@ -225,7 +231,7 @@ def generate_filter(args: argparse.Namespace):
 
 
 def load_model_isolated_with_allocator(
-    config: TorchBenchModelConfig, allocator: str, alloc_func: str, free_func: str, timeout: float = WORKER_TIMEOUT
+    config: TorchBenchModelConfig, allocator: str, alloc_func: str, free_func: str, cache_info_func: str, timeout: float = WORKER_TIMEOUT
 ) -> ModelTask:
     """Load and return the model in a subprocess. Optionally, save its stdout and stderr to the specified directory."""
     task = ModelTask(
@@ -238,6 +244,7 @@ def load_model_isolated_with_allocator(
         task.worker.run(
             f"""
             customized_alloc = torch.cuda.memory.CUDAPluggableAllocator('{allocator}', '{alloc_func}', '{free_func}')
+            customized_alloc.set_cache_info_fn('{cache_info_func}')
             torch.cuda.memory.change_current_allocator(customized_alloc)
         """
         )
@@ -330,14 +337,12 @@ def run(args: List[str]):
         for cfg in filter(cfg_filter, cfgs):
             print(f"[Round {_round}/{args.rounds}] Running {cfg}")
             try:
-                task = load_model_isolated_with_allocator(cfg, args.allocator, args.alloc_func, args.free_func)
+                task = load_model_isolated_with_allocator(cfg, args.allocator, args.alloc_func, args.free_func, args.cache_info_func)
                 # get the model memory snapshot
                 get_model_memory_snapshot(task, cfg, _round, args.iterations)
                 # get the model test metrics
                 metrics: TorchBenchModelMetrics = get_model_test_metrics(
                     task, metrics=args.metrics.split(",")
-                    # task, metrics=["latencies", "cpu_peak_mem", "gpu_peak_mem", "ttfb", "pt2_compilation_time", "pt2_graph_breaks"]
-                    # task, metrics=["latencies"]
                 )
                 single_round_result.append(
                     {
