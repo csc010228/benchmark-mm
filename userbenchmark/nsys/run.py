@@ -28,7 +28,7 @@ with add_path(REPO_PATH):
 WORKER_TIMEOUT = 3600  # seconds
 BS_FIELD_NAME = "batch_size"
 
-BM_NAME = "train-time"
+BM_NAME = "nsys"
 DEFAULT_ROUNDS = 3
 DEFAULT_BATCH_SIZE = 1
 DEFAULT_ITERATIONS = 15
@@ -38,6 +38,11 @@ DEFAULT_FREE_FUNC = "free"
 DEFAULT_CACHE_INFO_FUNC = "cache_info"
 
 WARMUP_ROUNDS = 0
+
+ALL_NSYS_METRICS = ['cuda', 'nvtx', 'cublas', 'cublas-verbose', 'cusolver', 
+           'cusolver-verbose', 'cusparse', 'cusparse-verbose', 'mpi', 'oshmem', 'ucx', 
+           'osrt', 'cudnn', 'opengl', 'opengl-annotations', 'openacc', 'openmp', 
+           'nvvideo', 'vulkan', 'vulkan-annotations', 'python-gil']
 
 
 timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -85,6 +90,13 @@ def parse_args(args: List[str]):
         default=DEFAULT_BATCH_SIZE,
         type=int,
         help="Batch size to use for the model.",
+    )
+    parser.add_argument(
+        '--metrics', 
+        type=str, 
+        default="all", 
+        choices=ALL_NSYS_METRICS + ["all"], 
+        help="Nsys metrics to be obtained, separated by commas.",
     )
     parser.add_argument(
         "-m",
@@ -222,56 +234,21 @@ def generate_filter(args: argparse.Namespace):
 
     return cfg_filter
 
-def init_model_task(config: TorchBenchModelConfig, timeout: float = WORKER_TIMEOUT) -> ModelTask:
+def init_model_task(config: TorchBenchModelConfig, metrics: str, output_dir, timeout: float = WORKER_TIMEOUT) -> ModelTask:
+    if metrics == "all":
+        metrics = ",".join(ALL_NSYS_METRICS)
     task = ModelTask(
         config.name,
         timeout=timeout,
         extra_env=config.extra_env,
         save_output_dir=config.output_dir,
+        extra_args = ["nsys", "profile", "-t", metrics, "-o", output_dir.joinpath(f"{timestamp}")]
     )
     return task
 
 def load_model_task_with_allocator_and_timer(
     task: ModelTask, config: TorchBenchModelConfig, allocator: str, alloc_func: str, free_func: str, cache_info_func: str
 ):
-    task.worker.run("import time")
-    task.worker.run("from torchbenchmark.util.extra_args import (TEST_STAGE)")
-    task.worker.run("""class RunTimer:
-    def __enter__(self):
-        self.t0 = time.time_ns()
-        return self
-        
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.t1 = time.time_ns()
-        run_times.append(self.t1 - self.t0)""")
-    task.worker.run("""class ForwardTimer:
-    def __enter__(self):
-        self.t0 = time.time_ns()
-        return self
-        
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.t1 = time.time_ns()
-        forward_times.append(self.t1 - self.t0)""")
-    task.worker.run("""class BackwardTimer:
-    def __enter__(self):
-        self.t0 = time.time_ns()
-        return self
-        
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.t1 = time.time_ns()
-        backward_times.append(self.t1 - self.t0)""")
-    task.worker.run("""class OptimizerTimer:
-    def __enter__(self):
-        self.t0 = time.time_ns()
-        return self
-        
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.t1 = time.time_ns()
-        optimizer_times.append(self.t1 - self.t0)""")
-    task.worker.store("run_times", [])
-    task.worker.store("forward_times", [])
-    task.worker.store("backward_times", [])
-    task.worker.store("optimizer_times", [])
     if allocator != DEFAULT_ALLOCATOR:
         task.worker.run(
             f"""
@@ -290,10 +267,6 @@ def load_model_task_with_allocator_and_timer(
         batch_size=config.batch_size,
         extra_args=config.extra_args,
     )
-    task.worker.run("model.add_context(RunTimer, TEST_STAGE.ALL)")
-    task.worker.run("model.add_context(ForwardTimer, TEST_STAGE.FORWARD)")
-    task.worker.run("model.add_context(BackwardTimer, TEST_STAGE.BACKWARD)")
-    task.worker.run("model.add_context(OptimizerTimer, TEST_STAGE.OPTIMIZER)")
     task_batch_size = task.get_model_attribute(BS_FIELD_NAME)
     # check batch size if not measuring accuracy
     if (
@@ -324,17 +297,13 @@ def run(args: List[str]):
         for cfg in filter(cfg_filter, cfgs):
             print(f"[Round {_round}/{args.rounds}] Running {cfg}")
             try:
-                task = init_model_task(cfg)
+                task = init_model_task(cfg, args.metrics, output_dir)
                 # get the model test metrics
                 with task.worker.watch_stdout_stderr() as get_output:
                     load_model_task_with_allocator_and_timer(task, cfg, args.allocator, args.alloc_func, args.free_func, args.cache_info_func)
                     metrics: TorchBenchModelMetrics = get_model_test_metrics(
                         task, metrics=["gpu_peak_mem"], nwarmup=0, num_iter=args.iterations
                     )
-                    run_times = task.worker.load("run_times")
-                    forward_times = task.worker.load("forward_times")
-                    backward_times = task.worker.load("backward_times")
-                    optimizer_times = task.worker.load("optimizer_times")
                     stdout, stderr = get_output()
                     single_round_out_err.append(
                         {
@@ -343,12 +312,7 @@ def run(args: List[str]):
                             "stderr": stderr,
                         }
                     )
-                raw_metrics = {
-                    "run_times": [x / NANOSECONDS_PER_MILLISECONDS for x in run_times],
-                    "forward_times": [x / NANOSECONDS_PER_MILLISECONDS for x in forward_times],
-                    "backward_times": [x / NANOSECONDS_PER_MILLISECONDS for x in backward_times],
-                    "optimizer_times": [x / NANOSECONDS_PER_MILLISECONDS for x in optimizer_times]
-                }
+                raw_metrics = {}
                 raw_metrics.update(metrics.__dict__)
                 single_round_result.append(
                     {

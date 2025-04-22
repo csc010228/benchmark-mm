@@ -68,7 +68,7 @@ def get_latencies(
 def get_peak_memory(
     func,
     device: str,
-    num_iter=MEMPROF_ITER,
+    num_iter=None,
     export_metrics_file="",
     metrics_needed=[],
     metrics_gpu_backend="torch",
@@ -109,10 +109,11 @@ def get_peak_memory(
     t1 = time.time_ns()
     # if total execution time is less than 15ms, we run the model for BENCHMARK_ITERS times
     #  to get more accurate peak memory
-    if (t1 - t0) < 15 * NANOSECONDS_PER_MILLISECONDS:
-        num_iter = BENCHMARK_ITERS
-    else:
-        num_iter = MEMPROF_ITER
+    if num_iter is None:
+        if (t1 - t0) < 15 * NANOSECONDS_PER_MILLISECONDS:
+            num_iter = BENCHMARK_ITERS
+        else:
+            num_iter = MEMPROF_ITER
 
     device_id = None
     gpu_peak_mem = None
@@ -213,6 +214,7 @@ def get_model_test_metrics(
         cpu_peak_mem, _device_id, gpu_peak_mem = get_peak_memory(
             model.invoke,
             device,
+            num_iter=num_iter,
             export_metrics_file=export_metrics_file,
             metrics_needed=metrics,
             metrics_gpu_backend=metrics_gpu_backend,

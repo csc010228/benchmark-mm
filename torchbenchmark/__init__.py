@@ -297,10 +297,20 @@ class Worker(subprocess_worker.SubprocessWorker):
     allows the subprocess PyTorch to properly bind threads.
     """
 
+    def __init__(
+        self,
+        timeout: Optional[float] = None,
+        extra_env: Optional[Dict[str, str]] = None,
+        save_output_dir: Optional[Path] = None,
+        extra_args: Optional[List[str]] = None,
+    ) -> None:
+        self.extra_args = extra_args
+        super().__init__(timeout=timeout, extra_env=extra_env, save_output_dir=save_output_dir)
+
     @property
     def args(self) -> List[str]:
         affinity = os.environ.get("GOMP_CPU_AFFINITY", "")
-        return (["taskset", "--cpu-list", affinity] if affinity else []) + super().args
+        return (self.extra_args if self.extra_args else []) + (["taskset", "--cpu-list", affinity] if affinity else []) + super().args
 
 
 class ModelTask(base_task.TaskBase):
@@ -315,13 +325,14 @@ class ModelTask(base_task.TaskBase):
         timeout: Optional[float] = None,
         extra_env: Optional[Dict[str, str]] = None,
         save_output_dir: Optional[pathlib.Path] = None,
+        extra_args: Optional[List[str]] = None,
     ) -> None:
         gc.collect()  # Make sure previous task has a chance to release the lock
         assert self._lock.acquire(blocking=False), "Failed to acquire lock."
 
         self._model_name = model_name
         self._worker = Worker(
-            timeout=timeout, extra_env=extra_env, save_output_dir=save_output_dir
+            timeout=timeout, extra_env=extra_env, save_output_dir=save_output_dir, extra_args=extra_args
         )
 
         self.worker.run("import torch")
