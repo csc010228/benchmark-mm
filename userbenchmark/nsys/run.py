@@ -302,7 +302,7 @@ def run(args: List[str]):
                 with task.worker.watch_stdout_stderr() as get_output:
                     load_model_task_with_allocator_and_timer(task, cfg, args.allocator, args.alloc_func, args.free_func, args.cache_info_func)
                     metrics: TorchBenchModelMetrics = get_model_test_metrics(
-                        task, metrics=["gpu_peak_mem"], nwarmup=0, num_iter=args.iterations
+                        task, metrics=["latencies"], nwarmup=0, num_iter=args.iterations
                     )
                     stdout, stderr = get_output()
                     single_round_out_err.append(
